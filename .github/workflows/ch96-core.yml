@@ -1,0 +1,315 @@
+# Reusable workflow for Chameleon96 cores that use this repository as the
+# "template" submodule (or any other submodules).
+#
+# A core calls it with a short workflow of its own (see "Automatic builds" in
+# Readme.md). Depending on the event that started the caller:
+#
+#   schedule (nightly):
+#     1. If `upstream` is set, merges that repository/branch (for example the
+#        MiSTer-devel core this port comes from). Conflicts in releases/ are
+#        resolved by dropping the file and conflicts in a submodule by taking
+#        upstream's commit; any other conflict stops the run: nothing is
+#        built, committed or published, and the summary lists the files.
+#     2. Moves every first-level submodule (template, ...) to the latest
+#        commit of its branch; nested submodules follow what their parent pins.
+#     3. If nothing changed in 1 or 2, stops here (no daily rebuilds).
+#   workflow_dispatch: 1 and 2 as above, and always builds.
+#   push: builds what was pushed (no merge, no submodule update).
+#
+#   Then it compiles `revision` with Quartus (Docker image `quartus_image`). If
+#   it compiles (and, with `require_timing`, meets setup timing in the slow
+#   model), the RBF is stored as releases/<core>_<YYYYMMDD>_ch96.rbf and
+#   pushed together with the merge/submodule commits, so the Chameleon96
+#   distribution picks it up. If it does not compile, nothing is pushed and the
+#   Quartus errors are shown in the run summary.
+#
+# The commits are made with GITHUB_TOKEN, which does not trigger other
+# workflows (so the push does not start the caller again).
+#
+# Node.js: actions that already run on Node 24 (checkout@v6,
+# upload-artifact@v6) and FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 for the rest.
+
+name: Chameleon96 core
+
+on:
+  workflow_call:
+    inputs:
+      revision:
+        description: Quartus revision to compile (name of the .qsf without extension), e.g. ao486_ch96
+        type: string
+        required: true
+      core:
+        description: Base name of the RBF in releases/, e.g. ao486 -> releases/ao486_YYYYMMDD_ch96.rbf
+        type: string
+        required: true
+      branch:
+        description: Branch to work on and push to (default, the repository default branch)
+        type: string
+        default: ''
+      upstream:
+        description: Optional repository URL to merge before building (e.g. https://github.com/MiSTer-devel/ao486_MiSTer.git)
+        type: string
+        default: ''
+      upstream_branch:
+        description: Branch of `upstream` to merge
+        type: string
+        default: master
+      update_submodules:
+        description: Move the submodules to the latest commit of their branch
+        type: boolean
+        default: true
+      quartus_image:
+        description: Docker image with Quartus
+        type: string
+        default: raetro/quartus:17.0
+      require_timing:
+        description: Do not publish the RBF if any clock has negative setup slack in the slow model
+        type: boolean
+        default: true
+      git_name:
+        description: Author of the commits made by the workflow
+        type: string
+        default: github-actions[bot]
+      git_email:
+        description: E-mail of the commits made by the workflow
+        type: string
+        default: 41898282+github-actions[bot]@users.noreply.github.com
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: ch96-core-${{ github.repository }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch || github.event.repository.default_branch }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Merge upstream
+        id: merge
+        if: inputs.upstream != '' && github.event_name != 'push'
+        env:
+          UPSTREAM: ${{ inputs.upstream }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+        run: |
+          git config user.name  "${{ inputs.git_name }}"
+          git config user.email "${{ inputs.git_email }}"
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream "$UPSTREAM_BRANCH"
+          U="upstream/$UPSTREAM_BRANCH"
+
+          if git merge-base --is-ancestor "$U" HEAD; then
+            echo "Already up to date with $U $(git rev-parse --short "$U")" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git merge --no-ff --no-commit "$U" || true
+
+          git diff --name-only --diff-filter=U | while read -r f; do
+            if [ "$(git ls-tree "$U" -- "$f" | awk '{print $1}')" = 160000 ]; then
+              git update-index --cacheinfo "160000,$(git rev-parse "$U:$f"),$f"
+            elif [ "${f#releases/}" != "$f" ]; then
+              git rm -q -f -- "$f"
+            fi
+          done
+
+          LEFT=$(git diff --name-only --diff-filter=U)
+          if [ -n "$LEFT" ]; then
+            {
+              echo "## Merge conflicts with $U"
+              echo "They have to be resolved by hand. Nothing has been built or published."
+              echo '```'
+              echo "$LEFT"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "$LEFT" | while read -r f; do echo "::error title=Merge conflict::$f"; done
+            exit 1
+          fi
+
+          git commit -q -m "Merge $UPSTREAM $UPSTREAM_BRANCH ($(git rev-parse --short "$U"))"
+          {
+            echo "## Merged $U $(git rev-parse --short "$U")"
+            echo '```'
+            git log --oneline HEAD^1..HEAD^2 | head -30
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Update submodules
+        id: subs
+        if: inputs.update_submodules && github.event_name != 'push'
+        run: |
+          git config user.name  "${{ inputs.git_name }}"
+          git config user.email "${{ inputs.git_email }}"
+          PATHS=$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}' || true)
+          if [ -z "$PATHS" ]; then
+            echo "No submodules" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git submodule update --init --recursive --quiet
+          for p in $PATHS; do echo "$p $(git -C "$p" rev-parse HEAD)"; done > "$RUNNER_TEMP/subs_old.txt"
+          # first level follows its branch; nested ones go to what their parent pins
+          git submodule update --remote --quiet
+          git add $PATHS        # before the next line, or it goes back to the pinned commit
+          git submodule update --init --recursive --quiet
+
+          if git diff --cached --quiet; then
+            echo "Submodules up to date" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MSG="Update submodules:"
+          echo "## Submodules updated" >> "$GITHUB_STEP_SUMMARY"
+          while read -r p old; do
+            new=$(git -C "$p" rev-parse HEAD)
+            [ "$old" = "$new" ] && continue
+            MSG="$MSG $p ${new:0:7}"
+            {
+              echo "### $p: ${old:0:7} -> ${new:0:7}"
+              echo '```'
+              git -C "$p" log --oneline "$old..$new" | head -20
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done < "$RUNNER_TEMP/subs_old.txt"
+          git commit -q -m "$MSG"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = schedule ] && \
+             [ "${{ steps.merge.outputs.changed }}" != true ] && \
+             [ "${{ steps.subs.outputs.changed }}" != true ]; then
+            echo "Nothing new: no build" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The Quartus image is about 6 GB compressed: make room on the runner first.
+      - name: Free disk space
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Download Quartus
+        if: steps.decide.outputs.build == 'true'
+        run: docker pull "${{ inputs.quartus_image }}"
+
+      # The .qsf may carry lines from newer Quartus versions (the ch96 projects
+      # are saved with 22.1) that 17.0 does not accept; they are removed only in
+      # this working copy, never committed.
+      - name: Compile
+        if: steps.decide.outputs.build == 'true'
+        env:
+          REV: ${{ inputs.revision }}
+        run: |
+          cp "$REV.qsf" "$RUNNER_TEMP/$REV.qsf.orig"
+          case "${{ inputs.quartus_image }}" in
+            *17.0*|*mister*) sed -i '/TIMING_ANALYZER_MULTICORNER_ANALYSIS/d' "$REV.qsf" ;;
+          esac
+          docker run --rm -v "$GITHUB_WORKSPACE":/build -w /build "${{ inputs.quartus_image }}" \
+            quartus_sh --flow compile "$REV"
+          cp "$RUNNER_TEMP/$REV.qsf.orig" "$REV.qsf"
+
+      - name: Quartus errors
+        if: failure() && steps.decide.outputs.build == 'true'
+        env:
+          REV: ${{ inputs.revision }}
+        run: |
+          ERR=$(cat output_files/$REV.*.rpt 2>/dev/null | grep -E '^(Error|Critical Warning) \(' | sort -u | head -40)
+          {
+            echo "## Quartus errors (nothing has been published)"
+            echo '```'
+            echo "${ERR:-No reports: see the log of the Compile step}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$ERR" | grep '^Error' | head -10 | while read -r l; do echo "::error title=Quartus::$l"; done
+
+      - name: Timing summary
+        id: timing
+        if: always() && steps.decide.outputs.build == 'true'
+        env:
+          REV: ${{ inputs.revision }}
+        run: |
+          STA=output_files/$REV.sta.rpt
+          [ -f "$STA" ] || { echo "No timing report" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          {
+            echo "## $REV - timing (slow model)"
+            echo '```'
+            for s in "Setup Summary" "Hold Summary" "Recovery Summary" "Removal Summary"; do
+              echo "== $s"
+              sed -n "/; .*Model $s/,/^\$/p" "$STA" | grep -E '^; (Slow|Fast)|^; [a-z_]' | cut -c1-110 || true
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # (no grep -q: with pipefail it would make sed fail with SIGPIPE)
+          NEG=$(sed -n '/; .*Model Setup Summary/,/^$/p' "$STA" | grep -cE ';[[:space:]]*-[0-9]+\.[0-9]+[[:space:]]*;' || true)
+          if [ "${NEG:-0}" -gt 0 ]; then
+            echo "::warning title=Timing::Negative setup slack: check $REV.sta.rpt"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            if [ "${{ inputs.require_timing }}" = true ]; then
+              echo "**Negative setup slack: the RBF is not published** (require_timing: true)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect the result
+        if: always() && steps.decide.outputs.build == 'true'
+        env:
+          REV: ${{ inputs.revision }}
+          CORE: ${{ inputs.core }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          [ -f "output_files/$REV.rbf" ] && cp "output_files/$REV.rbf" "$RUNNER_TEMP/dist/${CORE}_$(date -u +%Y%m%d)_ch96.rbf"
+          for r in map fit sta flow asm; do
+            [ -f "output_files/$REV.$r.rpt" ] && cp "output_files/$REV.$r.rpt" "$RUNNER_TEMP/dist/"
+          done
+          ls -la "$RUNNER_TEMP/dist"
+
+      - name: Upload the result
+        if: always() && steps.decide.outputs.build == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.revision }}-${{ github.sha }}
+          path: ${{ runner.temp }}/dist/
+          retention-days: 30
+
+      # Only reached if it compiled: the merge/submodule commits and the new RBF
+      # are pushed together.
+      - name: Publish the RBF in releases/
+        if: steps.decide.outputs.build == 'true' && (steps.timing.outputs.ok == 'true' || !inputs.require_timing)
+        env:
+          CORE: ${{ inputs.core }}
+          BRANCH: ${{ inputs.branch || github.event.repository.default_branch }}
+        run: |
+          git config user.name  "${{ inputs.git_name }}"
+          git config user.email "${{ inputs.git_email }}"
+          RBF=$(ls "$RUNNER_TEMP"/dist/${CORE}_*_ch96.rbf)
+          mkdir -p releases
+          cp "$RBF" releases/
+          git add releases/
+          git diff --cached --quiet || git commit -q -m "releases: $(basename "$RBF")"
+          for i in 1 2 3; do
+            git pull --rebase=merges --quiet origin "$BRANCH" && git push origin "HEAD:$BRANCH" && exit 0
+            sleep 5
+          done
+          exit 1

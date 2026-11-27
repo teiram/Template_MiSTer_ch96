@@ -47,3 +47,57 @@ MISTER_FB_PALETTE        | Framebuffer palette
 # Quartus version
 Cores must be developed in **Quartus v17.0.x**. It's recommended to have updates, so it will be **v17.0.2**. Newer versions won't give any benefits to FPGA used in MiSTer, however they will introduce incompatibilities in project settings and it will make harder to maintain the core and collaborate with others. **So please stick to good old 17.0.x version.** You may use either Lite or Standard license.
 
+
+# Automatic builds (Chameleon96)
+
+`.github/workflows/ch96-core.yml` is a reusable GitHub Actions workflow for the
+cores that use this repository as the `template` submodule. A core only needs
+this file, `.github/workflows/ch96.yml`:
+
+```yaml
+name: ch96
+
+on:
+  schedule:
+    - cron: '41 3 * * *'          # every night (UTC)
+  workflow_dispatch:              # Actions > ch96 > Run workflow
+  push:
+    branches: [master]
+    paths-ignore: ['releases/**', '**.md', 'docs/**']
+
+permissions:
+  contents: write
+
+jobs:
+  ch96:
+    uses: teiram/Template_MiSTer_ch96/.github/workflows/ch96-core.yml@master
+    with:
+      revision: ao486_ch96        # .qsf to compile
+      core: ao486                 # -> releases/ao486_YYYYMMDD_ch96.rbf
+      # upstream: https://github.com/MiSTer-devel/ao486_MiSTer.git   # optional
+      # upstream_branch: master
+```
+
+- **Every night**: moves the submodules (`template`, and any other) to the latest
+  commit of their branch and, if `upstream` is set, merges it. If something
+  changed, it compiles; if it compiles, it commits the new submodule pointers,
+  the merge and `releases/<core>_<YYYYMMDD>_ch96.rbf` and pushes them, so the
+  Chameleon96 distribution picks the new RBF up. If nothing changed, it does
+  nothing.
+- **Run workflow** (by hand): the same, but it always compiles.
+- **push**: compiles what was pushed and stores the RBF in `releases/`.
+- A merge conflict (outside `releases/` and the submodules) or a compilation
+  error stops the run before anything is pushed; the run summary shows the
+  conflicting files or the Quartus errors, and the timing summary is always
+  shown.
+- If any clock has negative setup slack (slow model) the RBF is not published
+  and the run shows a warning; `require_timing: false` publishes it anyway.
+- It compiles with Quartus 17.0 (`raetro/quartus:17.0`) by default
+  (`quartus_image` to change it). Lines of the `.qsf` that 17.0 does not
+  accept (`TIMING_ANALYZER_MULTICORNER_ANALYSIS`) are removed only for the
+  build. There is no public Docker image with 22.1, and 18.1-21.1 cannot be
+  used because `sys/` only has PLL files for 13, 17 and 22. Results may differ
+  from a local 22.1 build: ao486_ch96 compiles with 17.0 (82 % of the ALMs) but
+  its main clock misses setup timing by about 5 ns in the slow model.
+- Commits are made by `github-actions[bot]` unless `git_name` / `git_email`
+  are given.
